@@ -5,6 +5,7 @@
 
 use crate::SolveApp;
 use crate::ui_kit;
+use crate::ui_kit::BackingTooltipExt as _;
 use crate::ui_kit::{Container, Surface};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -74,6 +75,9 @@ pub fn run(app: &mut SolveApp, ctx: &egui::Context, item: &str) {
             app.set_status(msg, error);
         }
         "messages" => app.messages.open = true,
+        id if crate::links::by_id(id).is_some() => {
+            crate::links::run(ctx, id);
+        }
         "report" => {
             let dialog = app.dialog.clone();
             let error = dialog.as_ref().and_then(|d| d.error.clone()).or_else(|| app.preview.error.clone());
@@ -131,13 +135,14 @@ fn connect(app: &mut SolveApp, ctx: &egui::Context) {
 pub fn show(app: &mut SolveApp, ctx: &egui::Context, anchor: egui::Pos2) {
     if app.help.menu {
         let mut pick: Option<&str> = None;
+        let mut plugin_picked = false;
         let resp = Container::new(ctx, Surface::Popup)
             .area(egui::Id::unique("sc_help_menu"))
             .fixed_pos(anchor)
             .constrain(true)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                crate::context_menu::menu_frame(ui, |ui| {
+                crate::ui_kit::menu::menu_frame(ui, |ui| {
                     for (id, label, icon) in [
                         ("docs", "Documentation", "library"),
                         ("about", "About SolidCraft", "help"),
@@ -153,19 +158,32 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context, anchor: egui::Pos2) {
                     .filter(|(id, ..)| *id != "install_cli" || cfg!(target_os = "macos"))
                     {
                         let item = crate::ui_kit::Item::action(id, label, icon).on_if(available(app, id));
-                        if crate::context_menu::list_row(ui, &item).is_some() {
+                        if crate::ui_kit::menu::list_row(ui, &item).is_some() {
                             pick = Some(id);
                         }
                         // A layout without the version in the application bar lists it here.
                         if id == "about" && app.header.version == crate::toolbar::VersionPlace::HelpMenu {
                             let label = solidcraft_ui_text::format("help.version", &[("version", crate::update::current_version())]);
-                            if crate::context_menu::list_row(ui, &crate::ui_kit::Item::action("version", &label, "update")).is_some() {
+                            if crate::ui_kit::menu::list_row(ui, &crate::ui_kit::Item::action("version", &label, "update")).is_some() {
                                 pick = Some("version");
                             }
                         }
                     }
+                    // Support and community: always here, whether or not the status bar shows their buttons.
+                    crate::ui_kit::Menu::separator(ui);
+                    for link in crate::links::LINKS {
+                        let item = crate::ui_kit::Item::action(link.id, solidcraft_ui_text::tr(link.menu), link.icon);
+                        if crate::ui_kit::menu::list_row(ui, &item).is_some() {
+                            pick = Some(link.id);
+                        }
+                    }
+
+                    plugin_picked = crate::plugin_slots::menu_rows(app, ui, "Help");
                 })
             });
+        if plugin_picked {
+            app.help.menu = false;
+        }
         if let Some(p) = pick {
             run(app, ctx, p);
         } else if ctx.input(|i| i.pointer.any_pressed() || i.key_pressed(egui::Key::Escape)) && !resp.response.contains_pointer() {
@@ -200,6 +218,15 @@ fn about(app: &mut SolveApp, ctx: &egui::Context) {
                 solidcraft_ui_text::tr_label("Open-source parametric 3D CAD in Rust. Licensed MIT OR Apache-2.0."),
                 ui_kit::Text::Note("description"),
             );
+            ui.horizontal(|ui| {
+                for link in crate::links::LINKS {
+                    let button = ui_kit::button(ui, solidcraft_ui_text::tr(link.label), ui_kit::Button::Normal).backing_on_hover_text(link.url);
+                    crate::scenario::publish_target(&format!("about:{}", link.id), button.rect);
+                    if button.clicked() {
+                        crate::links::run(ui.ctx(), link.id);
+                    }
+                }
+            });
             let copy = ui_kit::button(ui, solidcraft_ui_text::tr_label("Copy diagnostic information"), ui_kit::Button::Normal);
             crate::scenario::publish_target("about:copy_diagnostics", copy.rect);
             if copy.clicked() {
@@ -213,18 +240,22 @@ fn about(app: &mut SolveApp, ctx: &egui::Context) {
                     ui_kit::text(ui, solidcraft_ui_text::tr("help.font_details"), ui_kit::Text::Report("fonts", false));
                 });
                 ui_kit::section(ui, "licences", solidcraft_ui_text::tr("help.licences"), false, |ui| {
-                    for (id, title, text) in
-                        [("notice", "help.notice", NOTICE), ("mit", "help.mit", LICENSE_MIT), ("apache", "help.apache", LICENSE_APACHE)]
-                    {
-                        ui_kit::section(ui, id, solidcraft_ui_text::tr(title), false, |ui| {
-                            ui_kit::text(ui, text, ui_kit::Text::Report(id, false));
-                        });
-                    }
-                    ui_kit::section(ui, "third_party", solidcraft_ui_text::tr("help.third_party"), false, |ui| {
-                        if ui_kit::button(ui, solidcraft_ui_text::tr_label("Copy all licences"), ui_kit::Button::Normal).clicked() {
-                            ctx.copy_text(solidcraft_engine::licences::all());
+                    // Indented, so the licences read as the children of Licences (#14388).
+                    ui.spacing_mut().indent = solidcraft_theme::Tokens::get().space_14;
+                    ui.indent("licence_list", |ui| {
+                        for (id, title, text) in
+                            [("notice", "help.notice", NOTICE), ("mit", "help.mit", LICENSE_MIT), ("apache", "help.apache", LICENSE_APACHE)]
+                        {
+                            ui_kit::section(ui, id, solidcraft_ui_text::tr(title), false, |ui| {
+                                ui_kit::text(ui, text, ui_kit::Text::Report(id, false));
+                            });
                         }
-                        ui_kit::text_lines(ui, "sc_third_party", THIRD_PARTY);
+                        ui_kit::section(ui, "third_party", solidcraft_ui_text::tr("help.third_party"), false, |ui| {
+                            if ui_kit::button(ui, solidcraft_ui_text::tr_label("Copy all licences"), ui_kit::Button::Normal).clicked() {
+                                ctx.copy_text(solidcraft_engine::licences::all());
+                            }
+                            ui_kit::text_lines(ui, "sc_third_party", THIRD_PARTY);
+                        });
                     });
                 });
             });
@@ -258,6 +289,25 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// #14388: the licences inside Licences are indented under its heading, so they read as its
+    /// children rather than as more sections beside it.
+    #[test]
+    fn the_licences_sit_indented_under_their_heading() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.help.about = true;
+        h.frames(2);
+        let key = |id: &str| format!("dialog:section:{}", solidcraft_ui_text::tr(id));
+        h.step(&serde_json::json!({"click": {"handle": key("help.licences")}})).unwrap();
+        h.frames(2);
+        let left = |id: &str| solidcraft_ui_registry::rect_of(&key(id)).map(|r| r.left());
+        let parent = left("help.licences").expect("the Licences heading");
+        assert_eq!(left("help.fonts"), Some(parent), "Fonts stays beside Licences");
+        for child in ["help.notice", "help.mit", "help.apache", "help.third_party"] {
+            let x = left(child).unwrap_or_else(|| panic!("{child} is not shown"));
+            assert!(x >= parent + solidcraft_theme::Tokens::get().space_14 - 0.5, "{child} at {x}, Licences at {parent}");
         }
     }
 

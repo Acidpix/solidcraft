@@ -135,7 +135,13 @@ pub fn current_version() -> &'static str {
 /// The release workflow built this binary (`SOLIDCRAFT_VERSION` is set there). Anything else is a
 /// development build, which never checks for updates.
 pub fn release_build() -> bool {
-    option_env!("SOLIDCRAFT_VERSION").is_some_and(|v| !v.is_empty()) && !cfg!(debug_assertions)
+    option_env!("SOLIDCRAFT_VERSION").is_some_and(|v| !v.is_empty() && !is_test_version(v)) && !cfg!(debug_assertions)
+}
+
+/// A one-off test build (`0.43.0-test+abc1234`, from test-build.yml): it is not a release, so it
+/// is treated like a development build and never checks for or offers an update.
+pub fn is_test_version(v: &str) -> bool {
+    parse_version(v).is_some_and(|v| v.pre.as_str() == "test")
 }
 
 // ---- installations ----------------------------------------------------------------------------
@@ -200,7 +206,7 @@ pub fn detect(p: &Probe) -> InstallKind {
             if let Some(id) = env("FLATPAK_ID") {
                 return InstallKind::Flatpak(id);
             }
-            if env("SNAP").is_some() && env("SNAP_NAME").is_none_or(|n| n.starts_with("solidcraft")) {
+            if is_snap(&env) {
                 // Locally installed (unasserted) snaps have revisions x1, x2, …
                 return InstallKind::Snap { store: !env("SNAP_REVISION").is_some_and(|r| r.starts_with('x')) };
             }
@@ -233,6 +239,12 @@ pub fn detect(p: &Probe) -> InstallKind {
         "macos" => app_bundle(&exe).map_or(InstallKind::Other, InstallKind::MacApp),
         _ => InstallKind::Other,
     }
+}
+
+/// The SolidCraft Snap is running: `SNAP` is set and `SNAP_NAME`, when set, is ours. SolidCraft
+/// started from a terminal inside another snap (a confined editor) sees that snap's variables.
+pub(crate) fn is_snap(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    env("SNAP").is_some() && env("SNAP_NAME").is_none_or(|n| n.starts_with("solidcraft"))
 }
 
 /// `path` is inside `dir` (Windows paths: case-insensitive).
@@ -666,6 +678,8 @@ pub struct Updater {
     pub installed: Option<Result<install::Outcome, String>>,
     /// A program for the host to start as SolidCraft exits (restart, installer).
     launch: Option<(PathBuf, Vec<String>)>,
+    /// The host should drop process-local graphics fallback overrides for this restart.
+    graphics_restart: bool,
 }
 
 impl Updater {
@@ -702,6 +716,7 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
     // Quitting to restart or install was cancelled (a "save changes?" answered Cancel).
     if app.updater.launch.is_some() && app.docs.quitting.is_none() && !app.quit_requested {
         app.updater.launch = None;
+        app.updater.graphics_restart = false;
     }
     if !app.updater.started {
         app.updater.started = true;
@@ -916,6 +931,7 @@ fn poll_install(app: &mut SolveApp) {
                 Ok(exe) => install::relaunch_after(program, args, &exe),
                 _ => (program.clone(), args.clone()),
             });
+            app.updater.graphics_restart = false;
             crate::documents::request_quit(app);
         }
         Ok(install::Outcome::Opened(dmg)) => {
@@ -935,8 +951,24 @@ fn poll_install(app: &mut SolveApp) {
 pub fn restart(app: &mut SolveApp) {
     if let Some(Ok(install::Outcome::Restart(program))) = &app.updater.installed {
         app.updater.launch = Some((program.clone(), Vec::new()));
+        app.updater.graphics_restart = false;
         crate::documents::request_quit(app);
     }
+}
+
+/// Apply a saved graphics choice through the ordinary quit/save flow. Cancellation
+/// leaves the app open and tick clears the scheduled relaunch.
+pub fn restart_graphics(app: &mut SolveApp) {
+    if let Some(launch) = app.services.graphics_restart.clone() {
+        app.updater.launch = Some(launch);
+        app.updater.graphics_restart = true;
+        crate::documents::request_quit(app);
+    }
+}
+
+/// Whether the pending launch applies graphics settings, consumed by the native host.
+pub fn take_graphics_restart(app: &mut SolveApp) -> bool {
+    std::mem::take(&mut app.updater.graphics_restart) && app.updater.launch.is_some()
 }
 
 /// For the host, as SolidCraft exits: the program to start (the new version, an installer).
